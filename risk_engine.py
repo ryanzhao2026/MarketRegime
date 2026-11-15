@@ -22,15 +22,17 @@ import numpy as np
 import pandas as pd
 
 import features as F
-from data import (CROSS_ASSET_UNIVERSE, EQUITY, HIGH_YIELD, SECTORS,
-                  SMALL_CAP, TECH, EQUAL_WEIGHT, MarketData)
+from data import (CROSS_ASSET_UNIVERSE, EQUITY, HIGH_YIELD, NFCI, RRP,
+                  SECTORS, SMALL_CAP, TECH, EQUAL_WEIGHT, WALCL, MarketData)
 
 FACTOR_WEIGHTS = {
-    "skew": 0.25,
-    "kurtosis": 0.15,
-    "drawdown": 0.25,
-    "correlation": 0.20,
-    "dispersion": 0.15,
+    "skew": 0.20,
+    "kurtosis": 0.12,
+    "drawdown": 0.22,
+    "correlation": 0.18,
+    "dispersion": 0.13,
+    # v2 新增：流动性条件（原五因子按比例让渡 15% 权重，总量仍为 1.0）
+    "liquidity": 0.15,
 }
 
 SKEW_LEN = 63
@@ -108,12 +110,61 @@ def compute(md: MarketData) -> pd.DataFrame:
         dispersion = pd.Series(np.nan, index=idx)
         disp_score = pd.Series(np.nan, index=idx)
 
+    # ---------- 6. 流动性条件（v2 新增）
+    # NFCI 是芝加哥联储的复合金融条件指数：0 为长期均值，正=偏紧。
+    # 辅以美联储资产负债表（WALCL）与隔夜逆回购（RRP）判断「钱在不在系统里」。
+    # 三者都是周频，缺失时整项为 NaN，权重自动重归一化。
+    liquidity_score = pd.Series(np.nan, index=idx)
+    nfci_now = pd.Series(np.nan, index=idx)
+    nfci_chg = pd.Series(np.nan, index=idx)
+    if NFCI in px.columns and px[NFCI].notna().sum() >= 20:
+        nfci_now = px[NFCI].reindex(idx).ffill(limit=15)
+        # 绝对水平：NFCI 长期均值 0，>0.3 明显偏紧，>1.0 为危机级
+        lvl = F.piecewise(
+            nfci_now,
+            [(-1.20, 0.0), (-0.70, 15.0), (-0.50, 28.0), (-0.30, 45.0),
+             (0.00, 62.0), (0.30, 78.0), (1.00, 92.0), (2.50, 100.0)],
+        )
+        # 变化方向：13 周（约一季度）加速收紧比绝对水平更早预警
+        nfci_chg = nfci_now.diff(13)
+        chg = F.piecewise(
+            nfci_chg,
+            [(-0.60, 0.0), (-0.25, 22.0), (0.0, 48.0), (0.25, 68.0),
+             (0.60, 85.0), (1.50, 100.0)],
+        )
+        parts = {"nfci_level": lvl, "nfci_chg": chg}
+        wts = {"nfci_level": 0.60, "nfci_chg": 0.40}
+
+        # 资产负债表与逆回购（可选增强）：扩表/逆回购回落 = 流动性宽松
+        if WALCL in px.columns and px[WALCL].notna().sum() >= 15:
+            walcl = px[WALCL].reindex(idx).ffill(limit=15)
+            wal_chg = (walcl / walcl.shift(13) - 1.0) * 100.0   # 13 周变化 %
+            parts["walcl"] = F.piecewise(
+                wal_chg,
+                [(-4.0, 0.0), (-1.5, 20.0), (0.0, 45.0), (1.5, 62.0),
+                 (4.0, 82.0), (8.0, 100.0)],
+            )
+            wts["walcl"] = 0.25
+        if RRP in px.columns and px[RRP].notna().sum() >= 15:
+            rrp = px[RRP].reindex(idx).ffill(limit=15)
+            rrp_chg = (rrp / rrp.shift(13) - 1.0) * 100.0
+            # 逆回购下降 = 资金回流体系（偏宽松），故反向计分
+            parts["rrp"] = 100.0 - F.piecewise(
+                rrp_chg,
+                [(-60.0, 0.0), (-25.0, 25.0), (0.0, 50.0), (25.0, 72.0),
+                 (60.0, 90.0), (150.0, 100.0)],
+            )
+            wts["rrp"] = 0.15
+        tot = sum(wts.values())
+        liquidity_score = F.weighted_mean(parts, {k: v / tot for k, v in wts.items()})
+
     factors = {
         "skew": skew_score,
         "kurtosis": kurt_score,
         "drawdown": dd_score,
         "correlation": corr_score,
         "dispersion": disp_score,
+        "liquidity": liquidity_score,
     }
     crisis_score = F.weighted_mean(factors, FACTOR_WEIGHTS)
 
@@ -124,6 +175,9 @@ def compute(md: MarketData) -> pd.DataFrame:
             "raw_drawdown": dd,
             "raw_avg_corr": avg_corr,
             "raw_dispersion": dispersion,
+            "raw_nfci": nfci_now,
+            "raw_nfci_chg13": nfci_chg,
+            "liquidity_score": liquidity_score,
             "skew_score": skew_score,
             "kurtosis_score": kurt_score,
             "drawdown_score": dd_score,

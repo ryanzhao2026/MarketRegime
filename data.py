@@ -2,7 +2,12 @@
 
 数据来源：同花顺 iFinD 历史日行情（收盘价，未复权用于价格序列展示；
 ETF 分红对 MA200 等长周期指标影响有限，已在 README 中说明）。
-频率：日频；样本区间 2024-01-02 至 2026-11-13。
+频率：日频。v2 起样本区间前推至 2006-01-03，覆盖 2008 金融危机、
+2020 熔断、2022 熊市三个完整压力期，使滚动分位与档位阈值具备跨周期含义。
+
+数据列分两类：
+  · 价格类（ETF / 指数）：必须为正，非正值视为缺失；
+  · 宏观类（HY_OAS / NFCI / WALCL / RRP）：可为负或为 0，不套用正数过滤。
 """
 
 from __future__ import annotations
@@ -31,10 +36,35 @@ HIGH_YIELD = "HYG"        # 高收益信用债
 GOLD = "GLD"              # 黄金
 COMMODITY = "DBC"         # 大宗商品
 DOLLAR = "DXY"            # 美元指数（CI 环境用 UUP 代理，见 fetch_data.py）
-DOLLAR_CANDIDATES = ("DXY", "DINI", "UUP")   # 兼容不同数据源列名
-VIX = "VIX"               # 隐含波动率
+VIX = "VIX"               # 隐含波动率（30 天）
+VIX9D = "VIX9D"           # 9 天 VIX（期限结构前端）
+VIX3M = "VIX3M"           # 3 个月 VIX（期限结构中段）
+VIX6M = "VIX6M"           # 6 个月 VIX（期限结构后端）
 VVIX = "VVIX"             # 波动率的波动率
-VIX3M = "VIX3M"           # 3 个月 VIX（期限结构用，当前未进入打分）
+
+# ---- v2 新增宏观序列（FRED，免 API Key）
+HY_OAS = "HY_OAS"         # ICE BofA 美国高收益债期权调整利差（%），纯信用定价
+NFCI = "NFCI"             # 芝加哥联储全国金融条件指数，0 为长期均值，正=偏紧
+WALCL = "WALCL"           # 美联储总资产（百万美元）
+RRP = "RRP"               # 隔夜逆回购余额（十亿美元）
+DOLLAR_BROAD = "DXY_BROAD"  # 美联储广义贸易加权美元指数（官方口径，替代 UUP 代理）
+
+# 美元口径优先级：官方广义指数 > DXY > 旧 iFinD 列名 > UUP 代理
+# 注意：必须定义在 DOLLAR_BROAD 之后，否则模块导入即失败
+DOLLAR_CANDIDATES = (DOLLAR_BROAD, "DXY", "DINI", "UUP")
+
+# 信用价差主口径：穆迪 Baa 与 10Y 国债利差（2006 起全历史）
+# HY OAS 虽更贴近高收益债，但免费端点仅回溯 3 年，故作为交叉验证列并存
+CREDIT_SPREAD = "CREDIT_SPREAD"
+
+# 宏观列：非价格，值可为负或 0，不做正数清洗
+MACRO_COLUMNS = frozenset({CREDIT_SPREAD, HY_OAS, NFCI, WALCL, RRP})
+
+# 模型版本：写入解释层与每日归档，保证跨版本分数可比性可追溯
+MODEL_VERSION = "v2"
+
+# 每日归档目录（工作流自动提交）
+ARCHIVE_DIR = os.path.join(BASE_DIR, "archive")
 
 SECTORS: tuple[str, ...] = ("XLK", "XLF", "XLE", "XLV")
 
@@ -136,8 +166,12 @@ def load_market_data(
         if {"high", "low", "close"}.issubset(keep):
             ohlc = raw[keep].reindex(prices.index).ffill()
 
-    # 价格序列做基础清洗：非正价格视为缺失
-    prices = prices.where(prices > 0)
+    # 价格序列做基础清洗：非正价格视为缺失。
+    # 宏观序列（NFCI 可为负、RRP 可为 0）不是价格，不能套用正数过滤，
+    # 否则会把整列静默清空，导致因子悄悄缺失。
+    price_cols = [c for c in prices.columns if c not in MACRO_COLUMNS]
+    if price_cols:
+        prices[price_cols] = prices[price_cols].where(prices[price_cols] > 0)
 
     if prices.columns.size == 0:
         raise DataError("行情宽表为空")

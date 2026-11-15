@@ -29,7 +29,7 @@ import cross_asset_engine
 import risk_engine
 import trend_engine
 import volatility_engine
-from data import EQUITY, MarketData
+from data import EQUITY, MODEL_VERSION, MarketData
 
 # ---------------------------------------------------------------- 权重
 WEIGHTS = {
@@ -270,6 +270,7 @@ def explain(row: pd.Series, n_universe: int = 8) -> dict:
 
     return {
         "asof": str(row.name.date()) if hasattr(row.name, "date") else str(row.name),
+        "model_version": MODEL_VERSION,
         "regime_score": float(score) if pd.notna(score) else None,
         "regime": regime,
         "regime_cn": REGIME_CN.get(regime, "未知"),
@@ -323,8 +324,18 @@ def format_report(res: dict) -> str:
     L.append(f"    波动    VIX={_fmt(v['vix'])}  VVIX={_fmt(v['vvix'])}  "
              f"RV={_pct(v['realized_vol_pct'], already=True)}"
              f"  扩张={_fmt(v['vol_expansion'], 2)}x")
+    L.append(f"            期限结构={_fmt(v['term_structure'], 3)} "
+             f"({v['term_structure_state']}, {v.get('term_curve_points', 0)} 端)")
+    # 信用维度按实际口径渲染：价差类是 pp，比值类才是 %
+    cs = c.get("credit_source", "unavailable")
+    if cs in ("CREDIT_SPREAD", "HY_OAS"):
+        L.append(f"    信用    {cs}={_fmt(c['credit_spread_pct'], 2)}  "
+                 f"63日变化={_fmt(c['credit_chg63'], 2)}pp  "
+                 f"({c['credit_label']})")
+    else:
+        L.append(f"    信用    {cs}={_pct(c['credit_chg63_pct'])}")
     L.append(f"    跨资产  SPY/TLT={_pct(c['spy_tlt_chg63_pct'])}  "
-             f"HYG/TLT={_pct(c['credit_chg63_pct'])}  DXY={_pct(c['dxy_chg63_pct'])}")
+             f"美元[{c.get('dollar_source', 'n/a')}]={_pct(c['dxy_chg63_pct'])}")
     L.append(f"    风险    偏度={_fmt(r['skew'], 2)}  回撤={_pct(r['drawdown_pct'], already=True)}  "
              f"相关={_fmt(r['avg_corr'], 2)}")
     L.append("")

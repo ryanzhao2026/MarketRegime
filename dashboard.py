@@ -346,7 +346,8 @@ def panel_drivers(res: dict, df: pd.DataFrame, md: MarketData) -> str:
         ("ADX(14)", _nv(d["trend"].get("adx"), 1)),
         ("距 EMA200", _nv(d["trend"].get("ema200_dist_pct"), 1, "%", True)),
         ("站上 MA200", d["breadth"].get("above_ma200_count") or "n/a"),
-        ("HYG/TLT 63日", _nv(d["cross_asset"].get("credit_chg63_pct"), 1, "%", True)),
+        ("期限结构 近/远", _nv(d["volatility"].get("term_structure"), 3)),
+        (_credit_label(d["cross_asset"]), _credit_value(d["cross_asset"])),
         ("美元指数 63日", _nv(d["cross_asset"].get("dxy_chg63_pct"), 1, "%", True)),
         ("收益偏度", _nv(d["risk"].get("skew"), 2)),
         ("当前回撤", _nv(d["risk"].get("drawdown_pct"), 1, "%")),
@@ -370,6 +371,28 @@ def panel_drivers(res: dict, df: pd.DataFrame, md: MarketData) -> str:
     <table class="mtable">{mrows}</table>
   </div>
 </div>"""
+
+
+def _credit_label(c: dict) -> str:
+    """信用维度的指标名随实际口径变化，避免用统一标签误导读者。"""
+    src = c.get("credit_source", "unavailable")
+    if src == "CREDIT_SPREAD":
+        return "信用价差(Baa-10Y)"
+    if src == "HY_OAS":
+        return "高收益OAS"
+    if src == "HYG/TLT(fallback)":
+        return "HYG/TLT 63日"
+    return "信用"
+
+
+def _credit_value(c: dict) -> str:
+    """价差类用绝对水平 + 变化(pp)；比值类只有变化(%)。"""
+    src = c.get("credit_source", "unavailable")
+    if src in ("CREDIT_SPREAD", "HY_OAS"):
+        lvl = _nv(c.get("credit_spread_pct"), 2)
+        chg = _nv(c.get("credit_chg63"), 2)
+        return f"{lvl} ({chg}pp)"
+    return _nv(c.get("credit_chg63_pct"), 1, "%", True)
 
 
 def _nv(v, nd=1, suffix="", signed=False):

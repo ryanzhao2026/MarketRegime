@@ -1,10 +1,33 @@
-"""波动率引擎：衡量「风险的价格」处于什么水平。
+"""波动率引擎 v2：衡量「风险的价格」处于什么水平。
 
-权重 20%。四个因子：
-  1. VIX          — 隐含波动率绝对水平
-  2. VVIX         — 波动率的波动率（尾部风险定价）
-  3. Realized Vol — SPY 21 日已实现波动率（年化）
-  4. Vol Expansion— 短期/长期波动率比值，捕捉波动率扩张
+权重 20%（不变）。五个子因子：
+  1. VIX            — 隐含波动率绝对水平
+  2. VVIX           — 波动率的波动率（尾部风险定价）
+  3. Realized Vol   — SPY 21 日已实现波动率（年化）
+  4. Vol Expansion  — 短期/长期波动率比值，捕捉波动率扩张
+  5. Term Structure — **四端期限结构**（v2 升级）
+
+v2 对期限结构做了什么
+--------------------
+v1 只用 VIX/VIX3M 两点，信息量有限。v2 改为四端曲线斜率：
+
+    front = (VIX9D + VIX) / 2        # 9 天 + 30 天
+    back  = (VIX3M + VIX6M) / 2      # 3 个月 + 6 个月
+    ratio = front / back
+
+ratio < 1 表示 contango（近端便宜，市场平静）；ratio > 1 表示
+backwardation（近端被抢高），是恐慌见顶的经典特征。
+用四端平均而非单点比值，可降低单一日期的噪声。
+
+分档阈值的来源
+------------
+全部由 CBOE 官方历史实测分位标定（2011-01-04 → 2026-11-13，3990 个交易日）：
+
+    p1=0.641  p5=0.681  p10=0.705  p25=0.752  p50=0.817
+    p75=0.902 p90=0.994 p95=1.062  p99=1.298
+
+说明：VIX9D 自 2011 年起才有数据，故 2008 年段的期限结构为 NaN，
+引擎按「缺失自动重归一化权重」处理，不向前填充造假。
 
 输出 vol_score ∈ [0, 100]：数值越高代表波动环境越危险。
 在最终打分中进入 (100 - vol_score) 项。
@@ -16,7 +39,7 @@ import numpy as np
 import pandas as pd
 
 import features as F
-from data import EQUITY, VIX, VIX3M, VVIX, MarketData
+from data import EQUITY, VIX, VIX3M, VIX6M, VIX9D, VVIX, MarketData
 
 FACTOR_WEIGHTS = {
     "vix": 0.30,
@@ -34,6 +57,18 @@ RV_LONG = 63
 # 直接剔除并重归一化权重，避免用错误量级的数据污染打分。
 VVIX_PLAUSIBLE_MIN = 50.0
 
+# 期限结构分档：由 CBOE 四端序列实测分位标定（见模块文档）
+TERM_CURVE_POINTS = [
+    (0.62, 0.0),     # 深度 contango（p1 以下），市场极度自满
+    (0.68, 12.0),    # p5
+    (0.72, 25.0),    # p10~p25
+    (0.82, 45.0),    # p50 附近，常态 contango
+    (0.90, 60.0),    # p75
+    (1.00, 78.0),    # p90，曲线趋平
+    (1.06, 88.0),    # p95，轻度倒挂
+    (1.30, 100.0),   # p99 以上，深度 backwardation
+]
+
 # 波动率分档（vol_score 阈值 → 标签）
 VOL_BANDS = (
     (25.0, "低波动"),
@@ -50,6 +85,26 @@ def vol_label(score: float) -> str:
         if score < upper:
             return name
     return "极端波动"
+
+
+def _term_curve(md: MarketData, idx: pd.Index) -> tuple[pd.Series, pd.Series]:
+    """返回 (front/back 比值, 判定所用的点数)。点数用于解释层披露。"""
+    def get(name: str) -> pd.Series | None:
+        if name in md.prices.columns and md.prices[name].notna().any():
+            return md.prices[name].reindex(idx).ffill(limit=5)
+        return None
+
+    s9d, s30, s3m, s6m = get(VIX9D), get(VIX), get(VIX3M), get(VIX6M)
+
+    # 优先四端曲线；缺 VIX9D/VIX6M 时退化为两端，并如实反映
+    if s9d is not None and s30 is not None and s3m is not None and s6m is not None:
+        front = (s9d + s30) / 2.0
+        back = (s3m + s6m) / 2.0
+        return F.safe_div(front, back), pd.Series(4.0, index=idx)
+    if s30 is not None and s3m is not None:
+        return F.safe_div(s30, s3m), pd.Series(2.0, index=idx)
+    nan = pd.Series(np.nan, index=idx)
+    return nan, pd.Series(0.0, index=idx)
 
 
 def compute(md: MarketData) -> pd.DataFrame:
@@ -93,7 +148,10 @@ def compute(md: MarketData) -> pd.DataFrame:
         vvix_score = pd.Series(np.nan, index=idx)
 
     # ---------- 3. 已实现波动率（年化，%）
-    price = md.series(EQUITY)
+    if EQUITY in md.prices.columns and md.prices[EQUITY].notna().any():
+        price = md.prices[EQUITY].reindex(idx).ffill()
+    else:
+        price = pd.Series(np.nan, index=idx)
     ret = price.pct_change()
     rv = F.realized_vol(ret, RV_SHORT) * 100.0
     rv_score = F.piecewise(
@@ -112,21 +170,9 @@ def compute(md: MarketData) -> pd.DataFrame:
          (1.8, 86.0), (2.6, 100.0)],
     )
 
-    # ---------- 5. VIX 期限结构（VIX / VIX3M）
-    # contango（近月 < 远月，比值 < 1）代表市场平静；backwardation（比值 > 1）
-    # 是恐慌见顶的经典特征——近端波动率被抢高。
-    if VIX3M in md.prices.columns and md.prices[VIX3M].notna().any() \
-            and vix.notna().any():
-        vix3m = md.prices[VIX3M].reindex(idx).ffill(limit=5)
-        term = F.safe_div(vix, vix3m)
-        term_score = F.piecewise(
-            term,
-            [(0.70, 0.0), (0.82, 22.0), (0.92, 42.0), (1.00, 56.0),
-             (1.06, 70.0), (1.15, 87.0), (1.30, 100.0)],
-        )
-    else:
-        term = pd.Series(np.nan, index=idx)
-        term_score = pd.Series(np.nan, index=idx)
+    # ---------- 5. 期限结构（v2：四端曲线）
+    term, term_points = _term_curve(md, idx)
+    term_score = F.piecewise(term, TERM_CURVE_POINTS)
 
     factors = {
         "vix": vix_score,
@@ -144,6 +190,7 @@ def compute(md: MarketData) -> pd.DataFrame:
             "raw_realized_vol_pct": rv,
             "raw_vol_expansion": expansion,
             "raw_term_structure": term,
+            "term_curve_points": term_points,
             "vix_score": vix_score,
             "vvix_score": vvix_score,
             "realized_vol_score": rv_score,
@@ -161,6 +208,8 @@ def describe(row: pd.Series) -> dict:
     vvix = row.get("raw_vvix", np.nan)
     rv = row.get("raw_realized_vol_pct", np.nan)
     exp = row.get("raw_vol_expansion", np.nan)
+    term = row.get("raw_term_structure", np.nan)
+    pts = row.get("term_curve_points", np.nan)
     score = row.get("vol_score", np.nan)
 
     if pd.isna(vix):
@@ -187,6 +236,18 @@ def describe(row: pd.Series) -> dict:
     else:
         exp_state = "平稳"
 
+    # 期限结构状态：以 1.0 为 contango / backwardation 分界
+    if pd.isna(term):
+        term_state = "未知"
+    elif term >= 1.06:
+        term_state = "倒挂（近端恐慌）"
+    elif term >= 1.00:
+        term_state = "趋平"
+    elif term >= 0.90:
+        term_state = "轻度 contango"
+    else:
+        term_state = "正常 contango"
+
     return {
         "vol_score": float(score) if pd.notna(score) else None,
         "vol_band": vol_label(score),
@@ -196,4 +257,7 @@ def describe(row: pd.Series) -> dict:
         "realized_vol_pct": float(rv) if pd.notna(rv) else None,
         "vol_expansion": float(exp) if pd.notna(exp) else None,
         "vol_expansion_state": exp_state,
+        "term_structure": float(term) if pd.notna(term) else None,
+        "term_structure_state": term_state,
+        "term_curve_points": int(pts) if pd.notna(pts) else 0,
     }

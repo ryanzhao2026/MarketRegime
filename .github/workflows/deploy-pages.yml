@@ -13,7 +13,7 @@ on:
     - cron: "15 22 * * 1-5"
 
 permissions:
-  contents: read
+  contents: write      # v2：需要提交每日归档 archive/*.json 与数据快照
   pages: write
   id-token: write
 
@@ -49,7 +49,7 @@ jobs:
       # continue-on-error: 数据源临时故障时不阻断构建，
       # 后续 main.py 会使用仓库中已提交的历史快照继续出图。
       # ---------------------------------------------------------------
-      - name: 抓取最新行情（Nasdaq + CBOE）
+      - name: 抓取最新行情与宏观数据（yfinance → Nasdaq → CBOE → FRED）
         id: fetch
         continue-on-error: true
         run: |
@@ -58,8 +58,10 @@ jobs:
             "https://api.nasdaq.com/api/quote/SPY/info?assetclass=etf" || true
           curl -sL -o /dev/null -w "cboe    HTTP %{http_code}\n" --max-time 20 \
             "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv" || true
-          echo "=== 开始取数 ==="
-          python fetch_data.py --start 2024-01-01
+          curl -sL -o /dev/null -w "fred    HTTP %{http_code}\n" --max-time 25 \
+            "https://fred.stlouisfed.org/graph/fredgraph.csv?id=NFCI" || true
+          echo "=== 开始取数（v2：起点 2006，覆盖三轮压力期）==="
+          python fetch_data.py --start 2006-01-03
 
       - name: 取数结果摘要
         if: always()
@@ -91,6 +93,25 @@ jobs:
 
       - name: 打印摘要到 Actions 日志
         run: cat outputs/report.txt
+
+      # ---------------------------------------------------------------
+      # 每日归档回写：把当日读数与数据快照提交回仓库。
+      # 目的：积累真实日频序列，才能观察「分数变化率」而非只看档位标签。
+      # [skip ci] 防止本提交再次触发工作流形成循环。
+      # ---------------------------------------------------------------
+      - name: 提交每日归档与数据快照
+        if: always()
+        continue-on-error: true
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add archive data outputs/regime_history.csv 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "无变更，跳过提交"
+          else
+            git commit -m "chore(data): 每日自动归档 $(date -u +%Y-%m-%d) [skip ci]"
+            git push
+          fi
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

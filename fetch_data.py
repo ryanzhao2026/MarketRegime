@@ -1,31 +1,43 @@
 #!/usr/bin/env python3
-"""取数层：抓取最新行情，生成 data/ 下的标准宽表。
+"""取数层 v2：抓取行情 + 宏观序列，生成 data/ 下的标准宽表。
 
-数据源分层（按优先级自动回退）
-------------------------------
+数据源分层（按优先级自动回退，**逐列**判定）
+------------------------------------------
 1. **yfinance**（主源）
-   一个库覆盖 ETF + 指数 + 美元指数，无需 API Key。
-   但 Yahoo 对**数据中心 IP**（含 GitHub Actions runner、云主机）限流极严，
-   常见 `YFRateLimitError(429)`。因此本层失败不致命，交给下层。
+   ETF + VIX/VVIX/VIX9D/VIX3M/VIX6M + ICE 美元指数，一个库全覆盖。
+   对数据中心 IP 限流严格（常见 429），失败不致命，交给下层。
 
-2. **Nasdaq 官方行情接口**（ETF 回退源）
-   直接提供 OHLCV，对数据中心 IP 友好，实测稳定。
+2. **Nasdaq 官方行情**（ETF 回退源）
+   OHLCV 直出。注意：部分网络环境下会整段不可达（HTTP 000）。
 
-3. **CBOE 官方指数历史**（VIX / VVIX / VIX3M 回退源）
-   权威来源，可修正 Yahoo 上指数序列的口径差异。
+3. **CBOE 官方指数历史**（波动率回退源）
+   VIX / VVIX / VIX9D / VIX3M / VIX6M 的权威源，含数十年历史。
 
-4. **仓库已有 CSV**（最后兜底）
-   全部源都失败时沿用上次数据，保证站点不出现空白。
+4. **FRED 官方宏观**（宏观与信用，v2 新增）
+   免 API Key（fredgraph.csv 端点）。
+   · BAA10Y    穆迪 Baa 与 10Y 国债利差 —— 纯信用定价，2006 起全历史
+   · BAMLH0A0HYM2  ICE BofA 高收益 OAS —— 受授权限制仅近 3 年，作补充
+   · NFCI      芝加哥联储全国金融条件指数
+   · WALCL     美联储总资产
+   · RRPONTSYD 隔夜逆回购
+   · DTWEXBGS  美联储广义贸易加权美元（官方口径，取代 UUP 代理）
 
-这种分层是刻意的：**yfinance 优先**满足易用性，**官方接口兜底**保证
-每日定时任务在 CI 环境里也能真正更新，而不是依赖一个会随机 429 的源。
+5. **仓库既有 CSV**（最后兜底）
+   保证站点不出现空白，但**会显式标记为降级**。
+
+设计要点
+--------
+· 信用因子用 BAA10Y 而非 HY OAS：后者虽更"专业"，但免费端点只回溯 3 年，
+  v2 的核心目标是把历史拉到 2006 以覆盖三轮压力期，故以长度为先，
+  同时把 HY OAS 一并取回作交叉验证。
+· 任何一列落到回退层或既有快照，都会在台账与 fetch_report.json 里标出
+  `degraded`，绝不静默补数——悄悄用旧数据是最危险的失败模式。
 
 用法
 ----
-    python fetch_data.py                     # 更新到最近交易日
-    python fetch_data.py --start 2024-01-01  # 指定起始日全量重建
-    python fetch_data.py --source yfinance   # 强制只用 yfinance
-    python fetch_data.py --source auto       # 默认，分层回退
+    python fetch_data.py                      # 增量更新到最近交易日
+    python fetch_data.py --start 2006-01-03   # 全量重建（默认即 2006）
+    python fetch_data.py --source yfinance    # 强制单源（调试用）
 """
 
 from __future__ import annotations
@@ -43,7 +55,8 @@ import pandas as pd
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_OUT = os.path.join(BASE_DIR, "data")
-DEFAULT_START = "2024-01-01"
+# v2：默认起点前推到 2006，覆盖 2008 / 2020 / 2022 三轮压力期
+DEFAULT_START = "2006-01-03"
 
 UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -51,36 +64,50 @@ UA = (
 )
 
 # ---------------------------------------------------------------- 标的映射
-# 输出列名 -> yfinance ticker
 YF_TICKERS: dict[str, str] = {
     # ETF
     "SPY": "SPY", "RSP": "RSP", "QQQ": "QQQ", "IWM": "IWM",
     "TLT": "TLT", "HYG": "HYG", "GLD": "GLD", "DBC": "DBC",
     "XLK": "XLK", "XLF": "XLF", "XLE": "XLE", "XLV": "XLV",
-    # 指数
-    "VIX": "^VIX", "VVIX": "^VVIX", "VIX3M": "^VIX3M",
-    # 美元指数（ICE DXY）
+    # 波动率指数（含期限结构四端）
+    "VIX": "^VIX", "VVIX": "^VVIX",
+    "VIX9D": "^VIX9D", "VIX3M": "^VIX3M", "VIX6M": "^VIX6M",
+    # ICE 美元指数
     "DXY": "DX-Y.NYB",
 }
 
 ETF_COLS = ["SPY", "RSP", "QQQ", "IWM", "TLT", "HYG", "GLD", "DBC",
             "XLK", "XLF", "XLE", "XLV"]
-INDEX_COLS = ["VIX", "VVIX", "VIX3M"]
+# CBOE 可提供的五个波动率序列
+INDEX_COLS = ["VIX", "VVIX", "VIX9D", "VIX3M", "VIX6M"]
 DOLLAR_COL = "DXY"
 
-# Nasdaq 回退用（仅 ETF）
+# FRED：输出列 -> (series_id, 说明)
+FRED_SERIES: dict[str, tuple[str, str]] = {
+    "CREDIT_SPREAD": ("BAA10Y", "穆迪 Baa 与 10Y 国债利差(%)"),
+    "HY_OAS": ("BAMLH0A0HYM2", "ICE BofA 高收益 OAS(%)"),
+    "NFCI": ("NFCI", "芝加哥联储金融条件指数"),
+    "WALCL": ("WALCL", "美联储总资产(百万美元)"),
+    "RRP": ("RRPONTSYD", "隔夜逆回购(十亿美元)"),
+    "DXY_BROAD": ("DTWEXBGS", "广义贸易加权美元指数"),
+}
+# 宏观列不是价格：不做正数清洗，且允许更长的前向填充（周频序列）
+MACRO_COLS = list(FRED_SERIES.keys())
+
 NASDAK_URL = (
     "https://api.nasdaq.com/api/quote/{sym}/historical"
     "?assetclass=etf&fromdate={frm}&todate={to}&limit=5000"
 )
-# CBOE 回退用（VIX/VVIX/VIX3M 官方历史）
-CBOE_URL = "https://cdn.cboe.com/api/global/us_indices/daily_prices/{sym}_History.csv"
-# 美元指数 yfinance 不可得时的代理
+CBOE_URL = ("https://cdn.cboe.com/api/global/us_indices/"
+            "daily_prices/{sym}_History.csv")
+FRED_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}&cosd={frm}"
+
 DOLLAR_PROXY_YF = "UUP"
 
 RETRIES = 3
 TIMEOUT = 45
 POLITE_SLEEP = 0.35
+FRED_SLEEP = 4.0        # FRED 对突发请求敏感，必须放慢
 
 
 # ================================================================ 工具
@@ -90,7 +117,7 @@ def _num(s) -> float:
     if isinstance(s, (int, float)):
         return float(s)
     t = str(s).replace(",", "").replace("$", "").strip()
-    if t in ("", "--", "N/A", "n/a", "None", "null"):
+    if t in ("", "--", ".", "N/A", "n/a", "None", "null"):
         return float("nan")
     try:
         return float(t)
@@ -98,7 +125,8 @@ def _num(s) -> float:
         return float("nan")
 
 
-def _get(url: str, *, json_mode: bool = False, retries: int = RETRIES):
+def _get(url: str, *, json_mode: bool = False, retries: int = RETRIES,
+         sleep_base: float = 1.2, timeout: int = TIMEOUT):
     last = None
     for attempt in range(1, retries + 1):
         try:
@@ -106,14 +134,14 @@ def _get(url: str, *, json_mode: bool = False, retries: int = RETRIES):
                 url, headers={"User-Agent": UA,
                               "Accept": "application/json, text/plain, */*",
                               "Accept-Language": "en-US,en;q=0.9"})
-            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 raw = r.read().decode("utf-8", errors="replace")
             return json.loads(raw) if json_mode else raw
         except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError,
                 json.JSONDecodeError, OSError) as e:
             last = e
             if attempt < retries:
-                time.sleep(1.2 * attempt)
+                time.sleep(sleep_base * attempt)
     print(f"    ! HTTP 失败({retries}次): {type(last).__name__}: {last}")
     return None
 
@@ -137,7 +165,6 @@ def fetch_yfinance(cols: list[str], start: str, end: str) -> dict[str, pd.Series
     if not tickers:
         return {}
 
-    # 批量拉取以减少请求数（限流时关键的优化）
     sym_list = list(dict.fromkeys(tickers.values()))
     raw = None
     for attempt in (1, 2):
@@ -154,7 +181,7 @@ def fetch_yfinance(cols: list[str], start: str, end: str) -> dict[str, pd.Series
                   f"{str(e)[:90]}")
         raw = None
         if attempt == 1:
-            time.sleep(20)          # 限流时给一点冷却再试一次
+            time.sleep(20)
 
     if raw is None or raw.empty:
         print("    ! yfinance 无数据（通常是被限流 429）")
@@ -226,6 +253,30 @@ def fetch_cboe(symbol: str) -> pd.Series | None:
     return _norm(s.to_frame("v"))["v"].dropna()
 
 
+# ================================================================ 源 4：FRED
+def fetch_fred(series_id: str, start: str) -> pd.Series | None:
+    """FRED 官方 CSV，无需 API Key。缺失值以 '.' 或空表示。"""
+    raw = _get(FRED_URL.format(sid=series_id, frm=start),
+               retries=4, sleep_base=3.0, timeout=70)
+    if not raw or not raw.strip():
+        return None
+    try:
+        df = pd.read_csv(StringIO(raw))
+    except Exception as e:                                    # noqa: BLE001
+        print(f"    ! {series_id} CSV 解析失败: {e}")
+        return None
+    if df.shape[1] < 2:
+        return None
+    dc = df.columns[0]
+    vc = df.columns[1]
+    s = pd.Series(pd.to_numeric(df[vc], errors="coerce").values,
+                  index=pd.to_datetime(df[dc], errors="coerce"))
+    s = s[s.index.notna()].dropna()
+    if s.empty:
+        return None
+    return _norm(s.to_frame("v"))["v"]
+
+
 # ================================================================ 组装
 def _load_existing(path: str) -> pd.DataFrame | None:
     if not os.path.exists(path):
@@ -247,30 +298,30 @@ def build(start: str, out_dir: str, mode: str = "auto") -> int:
 
     price_path = os.path.join(out_dir, "market_data.csv")
     ohlc_path = os.path.join(out_dir, "spy_ohlc.csv")
+    report_path = os.path.join(out_dir, "fetch_report.json")
     old = _load_existing(price_path)
 
     print(f"取数区间: {start} → {end}   模式: {mode}\n")
 
     closes: dict[str, pd.Series] = {}
     ledger: dict[str, str] = {}          # 列 -> 实际使用的源
+    degraded: list[str] = []             # 落到回退层/旧快照的列
     spy_ohlc: pd.DataFrame | None = None
 
     # ---------------- 1. yfinance（主源，批量）
     if mode in ("auto", "yfinance"):
         print("[源 1] yfinance（批量）")
-        wanted = [c for c in (ETF_COLS + INDEX_COLS + [DOLLAR_COL])]
+        wanted = ETF_COLS + INDEX_COLS + [DOLLAR_COL]
         yf_data = fetch_yfinance(wanted, start, end)
         if yf_data:
             for c, s in yf_data.items():
                 closes[c] = s
                 ledger[c] = "yfinance"
-            print(f"    ✓ 成功 {len(yf_data)} 列: "
-                  f"{', '.join(sorted(yf_data))}")
+            print(f"    ✓ 成功 {len(yf_data)} 列: {', '.join(sorted(yf_data))}")
             print(f"    最新日 {max(s.index[-1] for s in yf_data.values()).date()}")
         else:
             print("    ✗ 无数据，回退到官方接口")
 
-        # SPY OHLC 优先也取 yfinance
         if "SPY" in yf_data:
             try:
                 import yfinance as yf
@@ -299,6 +350,7 @@ def build(start: str, out_dir: str, mode: str = "auto") -> int:
                 continue
             closes[col] = df["close"].dropna()
             ledger[col] = "nasdaq"
+            degraded.append(col)
             if col == "SPY":
                 keep = [c for c in ("open", "high", "low", "close", "volume")
                         if c in df.columns]
@@ -318,13 +370,41 @@ def build(start: str, out_dir: str, mode: str = "auto") -> int:
                 continue
             closes[col] = s
             ledger[col] = "cboe"
+            degraded.append(col)
             print(f"    ✓ {col:<5} {len(s):>5} 行  "
                   f"{s.index[-1].date()}  {s.iloc[-1]:.2f}")
             time.sleep(POLITE_SLEEP)
 
-    # ---------------- 4. 美元指数兜底
-    if DOLLAR_COL not in closes:
-        # 先试 UUP 代理（yfinance 或 Nasdaq）
+    # ---------------- 4. FRED（宏观与信用，v2 新增）
+    missing_macro = [c for c in MACRO_COLS if c not in closes]
+    if mode in ("auto", "fred") and missing_macro:
+        print(f"\n[源 4] FRED 官方宏观（补 {len(missing_macro)} 个）")
+        for col in missing_macro:
+            sid, desc = FRED_SERIES[col]
+            s = fetch_fred(sid, start)
+            if s is None or s.empty:
+                print(f"    ! {col} ({sid}) 失败")
+                time.sleep(FRED_SLEEP)
+                continue
+            # 合理性校验：序列量级必须与已知常识相符，防止端点改版返回脏数据
+            med = float(s.median())
+            if col == "CREDIT_SPREAD" and not (0.3 <= med <= 15):
+                print(f"    ! {col} 中位数 {med:.2f} 异常，剔除")
+                time.sleep(FRED_SLEEP)
+                continue
+            if col == "NFCI" and not (-2.0 <= med <= 3.0):
+                print(f"    ! {col} 中位数 {med:.2f} 异常，剔除")
+                time.sleep(FRED_SLEEP)
+                continue
+            closes[col] = s
+            ledger[col] = f"fred:{sid}"
+            degraded.append(col)
+            print(f"    ✓ {col:<14} {len(s):>5} 行  {s.index.min().date()} → "
+                  f"{s.index[-1].date()}  末值 {s.iloc[-1]:.2f}  ({desc})")
+            time.sleep(FRED_SLEEP)
+
+    # ---------------- 5. 美元指数兜底（官方广义 > DXY > UUP 代理）
+    if "DXY_BROAD" not in closes and DOLLAR_COL not in closes:
         proxy = None
         if mode in ("auto", "yfinance"):
             try:
@@ -347,25 +427,27 @@ def build(start: str, out_dir: str, mode: str = "auto") -> int:
         if proxy is not None:
             closes[DOLLAR_COL] = proxy
             ledger[DOLLAR_COL] = f"uup-proxy({DOLLAR_PROXY_YF})"
+            degraded.append(DOLLAR_COL)
             print(f"\n[美元指数] 用 {DOLLAR_PROXY_YF} 代理，{len(proxy)} 行")
         else:
             print("\n[美元指数] 全部失败，跨资产引擎将自动降级")
 
-    # ---------------- 5. 既有 CSV 兜底
+    # ---------------- 6. 既有 CSV 兜底
     if old is not None:
         used_old = []
         for col in old.columns:
             if col not in closes and old[col].notna().any():
                 closes[col] = old[col].dropna()
                 ledger[col] = "existing-csv"
+                degraded.append(col)
                 used_old.append(col)
         if used_old:
-            print(f"\n[源 4] 沿用已有历史: {', '.join(used_old)}")
-        # 兼容旧列名 DINI
+            print(f"\n[源 5] 沿用已有历史: {', '.join(used_old)}")
         if DOLLAR_COL not in closes and "DINI" in old.columns \
                 and old["DINI"].notna().any():
             closes[DOLLAR_COL] = old["DINI"].dropna()
             ledger[DOLLAR_COL] = "existing-csv"
+            degraded.append(DOLLAR_COL)
 
     if "SPY" not in closes or closes["SPY"].empty:
         print("\n✗ 关键标的 SPY 无数据，终止（避免产出空站点）", file=sys.stderr)
@@ -375,8 +457,14 @@ def build(start: str, out_dir: str, mode: str = "auto") -> int:
     frame = pd.DataFrame(closes).sort_index()
     cal = closes["SPY"].index
     frame = frame.reindex(cal)
-    ffill_cols = [c for c in frame.columns if c != "SPY"]
-    frame[ffill_cols] = frame[ffill_cols].ffill(limit=5)
+
+    # 价格列最多补 5 个交易日；宏观列多为周频，允许 10 天
+    price_cols = [c for c in frame.columns if c not in MACRO_COLS and c != "SPY"]
+    macro_cols = [c for c in frame.columns if c in MACRO_COLS]
+    if price_cols:
+        frame[price_cols] = frame[price_cols].ffill(limit=5)
+    if macro_cols:
+        frame[macro_cols] = frame[macro_cols].ffill(limit=10)
 
     for c in list(frame.columns):
         if frame[c].dropna().empty:
@@ -385,7 +473,7 @@ def build(start: str, out_dir: str, mode: str = "auto") -> int:
 
     frame.index.name = "date"
     frame.to_csv(price_path, float_format="%.4f")
-    print(f"\n  → {price_path}  {frame.shape[0]} 行 × {frame.shape[1]} 列")
+    print(f"\n → {price_path}  {frame.shape[0]} 行 × {frame.shape[1]} 列")
 
     if spy_ohlc is not None and not spy_ohlc.empty:
         o = spy_ohlc.dropna(subset=[c for c in ("high", "low", "close")
@@ -396,9 +484,11 @@ def build(start: str, out_dir: str, mode: str = "auto") -> int:
 
     # ---------------- 数据源台账
     print("\n  数据源台账")
-    print("  " + "-" * 46)
+    print("  " + "-" * 52)
     for c in frame.columns:
-        print(f"    {c:<6} ← {ledger.get(c, '?')}")
+        src = ledger.get(c, "?")
+        flag = "  ⚠降级" if c in degraded else ""
+        print(f"    {c:<14} ← {src}{flag}")
 
     # ---------------- 新鲜度
     last = frame.index[-1]
@@ -408,20 +498,33 @@ def build(start: str, out_dir: str, mode: str = "auto") -> int:
         print("  ⚠ 数据可能滞后（含周末假日应 ≤4 天），请检查数据源",
               file=sys.stderr)
 
-    # 供 CI 判断是否降到回退源
-    used = set(ledger.values())
-    if "yfinance" not in used:
-        print("\n  注: yfinance 本次未成功（多为数据中心 IP 限流），"
-              "已由官方接口接管，数据仍为最新。")
+    # ---------------- 结构化报告（供 CI 与仪表盘读取降级状态）
+    report = {
+        "fetched_at": pd.Timestamp.now().isoformat(timespec="seconds"),
+        "requested_start": start,
+        "latest_trading_day": str(last.date()),
+        "rows": int(frame.shape[0]),
+        "columns": int(frame.shape[1]),
+        "per_column_source": {c: ledger.get(c, "?") for c in frame.columns},
+        "degraded_columns": sorted(set(degraded)),
+        "primary_source_hit": any(v == "yfinance" for v in ledger.values()),
+    }
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    print(f"  → {report_path}")
+
+    if report["degraded_columns"]:
+        print(f"\n⚠ 降级列: {', '.join(report['degraded_columns'])}")
+        print("  这些列未由主源提供，已在台账与 fetch_report.json 标记。")
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="抓取行情数据并生成标准宽表")
+    p = argparse.ArgumentParser(description="抓取行情与宏观数据并生成标准宽表")
     p.add_argument("--start", default=DEFAULT_START, help="起始日期 YYYY-MM-DD")
     p.add_argument("--out-dir", default=DEFAULT_OUT, help="输出目录")
     p.add_argument("--source", default="auto",
-                   choices=["auto", "yfinance", "nasdaq", "cboe"],
+                   choices=["auto", "yfinance", "nasdaq", "cboe", "fred"],
                    help="auto=分层回退（默认）；其余为强制单源")
     a = p.parse_args(argv)
     return build(a.start, a.out_dir, a.source)

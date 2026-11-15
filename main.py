@@ -76,8 +76,84 @@ def run(asof: str | None = None, make_png: bool = True, export_csv: bool = False
         f.write(report)
     print(f"      文本报告 → {txt_path}")
 
+    # 每日归档：只存分数与关键读数（几 KB），由工作流自动 commit。
+    # 目的：积累真实的日频读数序列，才能观察「变化率」而非只看档位标签。
+    arch_path = write_archive(res, md, df)
+
     return {"frame": df, "result": res, "report": report,
-            "html": html_path, "png": png_path, "info": info}
+            "html": html_path, "png": png_path, "info": info,
+            "archive": arch_path}
+
+
+def write_archive(res: dict, md, df) -> str | None:
+    """把当日结论写入 archive/{asof}.json，并维护 index.json 索引。"""
+    import json
+
+    from data import ARCHIVE_DIR, MODEL_VERSION
+
+    asof = res.get("asof")
+    if not asof:
+        return None
+    os.makedirs(ARCHIVE_DIR, exist_ok=True)
+
+    row = df.dropna(subset=["regime_score"]).iloc[-1]
+    d = res.get("detail", {})
+    v, c, r = d.get("volatility", {}), d.get("cross_asset", {}), d.get("risk", {})
+
+    snap = {
+        "model_version": MODEL_VERSION,
+        "asof": asof,
+        "regime": res.get("regime"),
+        "regime_cn": res.get("regime_cn"),
+        "regime_score": res.get("regime_score"),
+        "confidence": res.get("confidence"),
+        "pillars": {pc["key"]: round(pc["score"], 2)
+                    for pc in res.get("contributions", [])},
+        "contributions": {pc["key"]: round(pc["contribution"], 2)
+                          for pc in res.get("contributions", [])},
+        "readings": {
+            "vix": v.get("vix"),
+            "term_structure": v.get("term_structure"),
+            "term_structure_state": v.get("term_structure_state"),
+            "credit_spread": c.get("credit_spread_pct"),
+            "credit_source": c.get("credit_source"),
+            "credit_label": c.get("credit_label"),
+            "dollar_source": c.get("dollar_source"),
+            "dxy_chg63_pct": c.get("dxy_chg63_pct"),
+            "skew": r.get("skew"),
+            "drawdown_pct": r.get("drawdown_pct"),
+            "avg_corr": r.get("avg_corr"),
+        },
+        "drivers_positive": res.get("drivers_positive", []),
+        "drivers_negative": res.get("drivers_negative", []),
+    }
+    p = os.path.join(ARCHIVE_DIR, f"{asof}.json")
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(snap, f, ensure_ascii=False, indent=2, default=str)
+
+    # 索引：按日期升序，便于前端画轨迹
+    idx_path = os.path.join(ARCHIVE_DIR, "index.json")
+    entries: list[dict] = []
+    if os.path.exists(idx_path):
+        try:
+            with open(idx_path, encoding="utf-8") as f:
+                entries = json.load(f)
+        except Exception:                                      # noqa: BLE001
+            entries = []
+    entries = [e for e in entries if e.get("asof") != asof]
+    entries.append({
+        "asof": asof,
+        "model_version": MODEL_VERSION,
+        "regime": snap["regime"],
+        "regime_score": snap["regime_score"],
+        "confidence": snap["confidence"],
+    })
+    entries.sort(key=lambda e: e.get("asof") or "")
+    with open(idx_path, "w", encoding="utf-8") as f:
+        json.dump(entries, f, ensure_ascii=False, indent=2, default=str)
+
+    print(f"      每日归档 → {p}")
+    return p
 
 
 def main(argv: list[str] | None = None) -> int:
