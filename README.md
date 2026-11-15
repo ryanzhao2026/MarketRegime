@@ -359,16 +359,27 @@ CI 必须能在无凭据、无人值守的环境下自取数据，因此 `fetch_
 
 ETF 层用 Python 标准库 `urllib` 直连 Nasdaq；yfinance 为唯一新增依赖（见 `requirements.txt`）。
 
-### 为什么必须有回退：实测结论
+### 为什么必须有回退：两处实测结论
 
-在本项目和 GitHub Actions 的**数据中心 IP** 环境下，Yahoo Finance 对 yfinance 的请求存在严格限流：
+同一个 `fetch_data.py`，在两个不同网络环境下跑出了**完全相反**的主源表现。这正是保留四级回退的理由。
 
-- 直接调用 `yfinance.download()`：**100% 返回 `YFRateLimitError`（HTTP 429）**
-- 使用 `curl_cffi` 伪装 Chrome 浏览器指纹：**同样 429**，无法绕过
-- 实测回退生效结果：12 只 ETF 由 Nasdaq 接管，VIX/VVIX/VIX3M 由 CBOE 接管，DXY 由 UUP 代理，最新交易日仍正常推进
+**场景 A：本地沙箱（开发环境）—— yfinance 被限流，回退层救场**
 
-因此 yfinance 在本场景下属于「**优先但不保证可用**」：它能让取数逻辑保持简洁，但**真正保证每日更新跑通的是回退层**。
-若将来 yfinance 恢复可用，代码无需改动，会自动回到主源。
+- 直接 `yfinance.download()`：**100% 返回 `YFRateLimitError`（HTTP 429）**
+- 用 `curl_cffi` 伪装 Chrome 浏览器指纹：**同样 429**，无法绕过
+- 实际供数：12 只 ETF ← Nasdaq，VIX / VVIX / VIX3M ← CBOE，DXY ← UUP 代理
+
+**场景 B：GitHub Actions runner（CI 环境）—— yfinance 全部成功**
+
+- `[源 1] yfinance（批量）✓ 成功 16 列`：ETF、VIX、VVIX、VIX3M、DXY **全部来自 yfinance**，最新日 2026-11-13
+- 同一时刻的连通性预检：`nasdaq HTTP 000`（不可达），`cboe HTTP 200`
+- 结论：**CI 环境里 Nasdaq 反而是不通的那一个**，yfinance 正常
+
+**这两次实测说明什么**
+
+- 限流是**按 IP 段与时段变化**的，不能靠单次测试断定某个源"一定可用"或"一定不可用"。
+- 单一数据源随时可能整体失效（本地 Yahoo 挂、CI 里 Nasdaq 挂），**回退层因此不是可选优化，而是每日更新能长期跑通的前提**。
+- CI 里 2026-11-15 的实际台账为 16/16 全部 ← yfinance，即主源正常工作；一旦将来 yfinance 在 CI 也被限流，代码会自动落到 Nasdaq / CBOE，无需改动。
 
 ## 运行
 
@@ -417,7 +428,7 @@ term_structure = VIX / VIX3M
 ## 局限与后续
 
 - `fetch_data.py` 依赖第三方公开接口的可用性。yfinance / Nasdaq / CBOE 若变更结构或限流，取数会按四级架构逐级回退，最终回退到历史快照。
-- yfinance 在数据中心 IP 下大概率被限流（实测 429），此时实际由 Nasdaq + CBOE 供数。数据口径一致，但**回退层的可用性决定了每日更新是否成功**，建议定期查看运行日志中的数据源台账。
+- 各数据源可用性随 IP 段与时段波动：本地沙箱实测 yfinance 429 而 Nasdaq 可用；GitHub Actions 实测 yfinance 全部成功而 Nasdaq 不可达。**回退层的可用性决定了每日更新是否成功**，建议每次运行后查看日志中的数据源台账（`SPY ← yfinance` 这类逐列标注）。
 - CBOE 指数 CSV 是**全量历史**（几十年），每次都会完整下载；如需减少流量可在 `fetch_cboe()` 里加区间裁剪。
 - GitHub 定时任务是**尽力而为**：高峰期可能延迟数十分钟，不适合对时间精度敏感的场景。
 - 仍未解决：全成分股广度（当前仍为 8 只 ETF 代理）、价格复权。
