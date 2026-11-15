@@ -107,7 +107,16 @@ DOLLAR_PROXY_YF = "UUP"
 RETRIES = 3
 TIMEOUT = 45
 POLITE_SLEEP = 0.35
-FRED_SLEEP = 4.0        # FRED 对突发请求敏感，必须放慢
+FRED_SLEEP = 1.5        # FRED 对突发请求敏感，放慢但不过度
+
+# ---- FRED 全局预算（关键）
+# FRED 一旦连不上，单序列最坏耗时 = curl 重试 + urllib 重试 + 四段窗口回退，
+# 六序列叠加可超过一小时（实测 CI 曾卡住 40 分钟以上）。
+# 因此设三重上限：单请求超时、整个 FRED 阶段的总预算、连续失败快速放弃。
+FRED_CURL_TIMEOUT = 40      # 单次 curl 上限（秒）
+FRED_CURL_RETRIES = 2
+FRED_STAGE_BUDGET = 180     # 整个 FRED 阶段的墙钟预算（秒）
+FRED_FAIL_FAST = 2          # 连续失败 N 个序列后放弃剩余
 
 
 # ================================================================ 工具
@@ -315,33 +324,43 @@ def _parse_fred(raw: str | None) -> pd.Series | None:
     return s if not s.empty else None
 
 
-def fetch_fred(series_id: str, start: str) -> pd.Series | None:
+def fetch_fred(series_id: str, start: str,
+               deadline: float | None = None) -> pd.Series | None:
     """FRED 官方 CSV，无需 API Key。缺失值以 '.' 或空表示。
 
     取数顺序：整段(curl) → 整段(urllib) → 分段(curl) → 分段(urllib)。
     分段的意义：FRED 生成长区间 CSV 较慢，切窗后单次响应更小、更易成功。
+
+    deadline 是绝对时间戳（time.monotonic 口径）。每次发起网络请求前检查，
+    一旦超出预算立即返回 None，保证不会被单个序列拖死整条流水线。
     """
+    def _expired() -> bool:
+        return deadline is not None and time.monotonic() > deadline
+
     url = FRED_URL.format(sid=series_id, frm=start)
 
-    s = _parse_fred(_curl_text(url))
-    if s is None:
-        s = _parse_fred(_get(url, retries=2, sleep_base=3.0, timeout=60))
-    if s is not None:
-        time.sleep(FRED_SLEEP)
-        return _norm(s.to_frame("v"))["v"]
+    if not _expired():
+        s = _parse_fred(_curl_text(url, timeout=FRED_CURL_TIMEOUT,
+                                   retries=FRED_CURL_RETRIES))
+        if s is None and not _expired():
+            s = _parse_fred(_get(url, retries=1, sleep_base=2.0, timeout=35))
+        if s is not None:
+            time.sleep(FRED_SLEEP)
+            return _norm(s.to_frame("v"))["v"]
 
     parts: list[pd.Series] = []
     for a, b in FRED_CHUNKS:
         if b < start:
             continue
+        if _expired():
+            print(f"    ! {series_id} 超出 FRED 阶段预算，停止分段回退")
+            break
         a2 = max(a, start)
         u = f"{FRED_URL.format(sid=series_id, frm=a2)}&coed={b}"
-        p = _parse_fred(_curl_text(u, timeout=60, retries=2))
-        if p is None:
-            p = _parse_fred(_get(u, retries=1, sleep_base=2.0, timeout=45))
+        p = _parse_fred(_curl_text(u, timeout=FRED_CURL_TIMEOUT, retries=1))
         if p is not None:
             parts.append(p)
-        time.sleep(2.0)
+        time.sleep(1.0)
     if not parts:
         return None
     s = pd.concat(parts).sort_index()
@@ -451,13 +470,25 @@ def build(start: str, out_dir: str, mode: str = "auto") -> int:
     missing_macro = [c for c in MACRO_COLS if c not in closes]
     if mode in ("auto", "fred") and missing_macro:
         print(f"\n[源 4] FRED 官方宏观（补 {len(missing_macro)} 个）")
+        # 阶段总预算 + 连续失败快速放弃：防止 FRED 整体不可用时把流水线拖死
+        fred_deadline = time.monotonic() + FRED_STAGE_BUDGET
+        consec_fail = 0
         for col in missing_macro:
+            if time.monotonic() > fred_deadline:
+                print(f"    ! FRED 阶段预算 {FRED_STAGE_BUDGET}s 用尽，"
+                      f"放弃剩余 {len(missing_macro)} 个序列")
+                break
+            if consec_fail >= FRED_FAIL_FAST:
+                print(f"    ! FRED 连续失败 {consec_fail} 次，快速放弃剩余序列")
+                break
             sid, desc = FRED_SERIES[col]
-            s = fetch_fred(sid, start)
+            s = fetch_fred(sid, start, deadline=fred_deadline)
             if s is None or s.empty:
                 print(f"    ! {col} ({sid}) 失败")
+                consec_fail += 1
                 time.sleep(FRED_SLEEP)
                 continue
+            consec_fail = 0
             # 合理性校验：序列量级必须与已知常识相符，防止端点改版返回脏数据
             med = float(s.median())
             if col == "CREDIT_SPREAD" and not (0.3 <= med <= 15):
