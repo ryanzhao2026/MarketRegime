@@ -1,0 +1,24 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.Python
+
+# ---- 运行产物（由 main.py 重新生成，不入库）----
+outputs/*.png
+outputs/*.html
+outputs/*.csv
+outputs/*.txt
+outputs/.png_meta
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ---- 数据缓存（如需锁定数据版本，请删掉下面这行）----
+# data/*.csv

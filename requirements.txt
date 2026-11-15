@@ -1,0 +1,12 @@
+# Market Regime Monitor — 运行依赖
+# 安装： pip install -r requirements.txt
+#
+# 说明：
+#   pandas / numpy  —— 数据与计算核心（必需）
+#   matplotlib      —— 仅 PNG 预览需要；只跑 HTML 时可省略
+#
+# 版本下限为开发验证版本，向上兼容。
+
+pandas>=2.0,<3.0
+numpy>=1.24,<3.0
+matplotlib>=3.7,<4.0
