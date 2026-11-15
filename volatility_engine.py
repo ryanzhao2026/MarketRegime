@@ -16,13 +16,14 @@ import numpy as np
 import pandas as pd
 
 import features as F
-from data import EQUITY, VIX, VVIX, MarketData
+from data import EQUITY, VIX, VIX3M, VVIX, MarketData
 
 FACTOR_WEIGHTS = {
-    "vix": 0.35,
-    "vvix": 0.20,
-    "realized_vol": 0.25,
-    "vol_expansion": 0.20,
+    "vix": 0.30,
+    "vvix": 0.15,
+    "realized_vol": 0.20,
+    "vol_expansion": 0.15,
+    "term_structure": 0.20,
 }
 
 RV_SHORT = 21
@@ -111,11 +112,28 @@ def compute(md: MarketData) -> pd.DataFrame:
          (1.8, 86.0), (2.6, 100.0)],
     )
 
+    # ---------- 5. VIX 期限结构（VIX / VIX3M）
+    # contango（近月 < 远月，比值 < 1）代表市场平静；backwardation（比值 > 1）
+    # 是恐慌见顶的经典特征——近端波动率被抢高。
+    if VIX3M in md.prices.columns and md.prices[VIX3M].notna().any() \
+            and vix.notna().any():
+        vix3m = md.prices[VIX3M].reindex(idx).ffill(limit=5)
+        term = F.safe_div(vix, vix3m)
+        term_score = F.piecewise(
+            term,
+            [(0.70, 0.0), (0.82, 22.0), (0.92, 42.0), (1.00, 56.0),
+             (1.06, 70.0), (1.15, 87.0), (1.30, 100.0)],
+        )
+    else:
+        term = pd.Series(np.nan, index=idx)
+        term_score = pd.Series(np.nan, index=idx)
+
     factors = {
         "vix": vix_score,
         "vvix": vvix_score,
         "realized_vol": rv_score,
         "vol_expansion": expansion_score,
+        "term_structure": term_score,
     }
     vol_score = F.weighted_mean(factors, FACTOR_WEIGHTS)
 
@@ -125,10 +143,12 @@ def compute(md: MarketData) -> pd.DataFrame:
             "raw_vvix": vvix,
             "raw_realized_vol_pct": rv,
             "raw_vol_expansion": expansion,
+            "raw_term_structure": term,
             "vix_score": vix_score,
             "vvix_score": vvix_score,
             "realized_vol_score": rv_score,
             "vol_expansion_score": expansion_score,
+            "term_structure_score": term_score,
             "vol_score": vol_score,
         },
         index=idx,

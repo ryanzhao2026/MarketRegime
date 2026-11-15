@@ -1,23 +1,22 @@
 name: Build & Deploy Dashboard
 
 # 触发方式：
-#   1. push 到 main 分支 —— 改代码后自动重建仪表盘
+#   1. push 到 main 分支 —— 改代码后自动重建
 #   2. 手动触发（Actions 页面点 Run workflow）
-#   3. 每个交易日 UTC 22:30（美股收盘后）定时重建
+#   3. 每个交易日 UTC 22:15（美股收盘后约 1 小时）自动取数 + 重建
 on:
   push:
     branches: [main]
   workflow_dispatch:
   schedule:
-    - cron: "30 22 * * 1-5"
+    # UTC 22:15 = 美东 17:15（夏令时）/ 18:15（冬令时），收盘后数据已落库
+    - cron: "15 22 * * 1-5"
 
-# GitHub Pages 部署所需的权限
 permissions:
   contents: read
   pages: write
   id-token: write
 
-# 同一时间只跑一个部署，新任务不取消进行中的（避免半成品上线）
 concurrency:
   group: pages
   cancel-in-progress: false
@@ -44,6 +43,38 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq fonts-noto-cjk
+
+      # ---------------------------------------------------------------
+      # 取数步骤：抓取最新行情到 data/*.csv
+      # continue-on-error: 数据源临时故障时不阻断构建，
+      # 后续 main.py 会使用仓库中已提交的历史快照继续出图。
+      # ---------------------------------------------------------------
+      - name: 抓取最新行情（Nasdaq + CBOE）
+        id: fetch
+        continue-on-error: true
+        run: |
+          echo "=== 数据源连通性预检 ==="
+          curl -s -o /dev/null -w "nasdaq  HTTP %{http_code}\n" --max-time 20 \
+            "https://api.nasdaq.com/api/quote/SPY/info?assetclass=etf" || true
+          curl -sL -o /dev/null -w "cboe    HTTP %{http_code}\n" --max-time 20 \
+            "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv" || true
+          echo "=== 开始取数 ==="
+          python fetch_data.py --start 2024-01-01
+
+      - name: 取数结果摘要
+        if: always()
+        run: |
+          if [ -f data/market_data.csv ]; then
+            python - <<'PY'
+          import pandas as pd
+          d = pd.read_csv("data/market_data.csv", index_col=0, parse_dates=True)
+          print(f"数据文件: {d.shape[0]} 行 × {d.shape[1]} 列")
+          print(f"区间    : {d.index.min().date()} → {d.index.max().date()}")
+          print(f"最新值  : SPY={d['SPY'].iloc[-1]:.2f}  "
+                f"VIX={d['VIX'].iloc[-1]:.2f}  VVIX={d['VVIX'].iloc[-1]:.2f}")
+          PY
+          fi
+          echo "fetch outcome: ${{ steps.fetch.outcome }}"
 
       - name: 运行 Regime 引擎
         run: python main.py --export-csv

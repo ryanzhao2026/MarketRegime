@@ -30,9 +30,11 @@ LONG_BOND = "TLT"         # 20 年期美债
 HIGH_YIELD = "HYG"        # 高收益信用债
 GOLD = "GLD"              # 黄金
 COMMODITY = "DBC"         # 大宗商品
-DOLLAR = "DINI"           # 美元指数
+DOLLAR = "DXY"            # 美元指数（CI 环境用 UUP 代理，见 fetch_data.py）
+DOLLAR_CANDIDATES = ("DXY", "DINI", "UUP")   # 兼容不同数据源列名
 VIX = "VIX"               # 隐含波动率
 VVIX = "VVIX"             # 波动率的波动率
+VIX3M = "VIX3M"           # 3 个月 VIX（期限结构用，当前未进入打分）
 
 SECTORS: tuple[str, ...] = ("XLK", "XLF", "XLE", "XLV")
 

@@ -17,7 +17,8 @@ import numpy as np
 import pandas as pd
 
 import features as F
-from data import DOLLAR, EQUITY, GOLD, HIGH_YIELD, LONG_BOND, MarketData
+from data import (DOLLAR_CANDIDATES, EQUITY, GOLD, HIGH_YIELD, LONG_BOND,
+                  MarketData)
 
 FACTOR_WEIGHTS = {
     "spy_tlt": 0.30,
@@ -58,7 +59,8 @@ def compute(md: MarketData) -> pd.DataFrame:
 
     spy, tlt = col(EQUITY), col(LONG_BOND)
     hyg, gld = col(HIGH_YIELD), col(GOLD)
-    dxy = col(DOLLAR)
+    # 美元指数列名随数据源不同（DXY / DINI / UUP），按候选顺序取第一个可用的
+    dxy = next((c for c in (col(t) for t in DOLLAR_CANDIDATES) if c is not None), None)
 
     # ---------- 1. SPY / TLT
     if spy is not None and tlt is not None:
