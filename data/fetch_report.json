@@ -1,0 +1,42 @@
+{
+  "fetched_at": "2026-11-15T15:12:22",
+  "requested_start": "2006-01-03",
+  "latest_trading_day": "2026-11-13",
+  "rows": 5250,
+  "columns": 24,
+  "per_column_source": {
+    "SPY": "yfinance",
+    "RSP": "yfinance",
+    "QQQ": "yfinance",
+    "IWM": "yfinance",
+    "TLT": "yfinance",
+    "HYG": "yfinance",
+    "GLD": "yfinance",
+    "DBC": "yfinance",
+    "XLK": "yfinance",
+    "XLF": "yfinance",
+    "XLE": "yfinance",
+    "XLV": "yfinance",
+    "VIX": "yfinance",
+    "VVIX": "yfinance",
+    "VIX9D": "yfinance",
+    "VIX3M": "yfinance",
+    "VIX6M": "yfinance",
+    "DXY": "yfinance",
+    "CREDIT_SPREAD": "existing-csv",
+    "HY_OAS": "existing-csv",
+    "NFCI": "existing-csv",
+    "WALCL": "existing-csv",
+    "RRP": "existing-csv",
+    "DXY_BROAD": "existing-csv"
+  },
+  "degraded_columns": [
+    "CREDIT_SPREAD",
+    "DXY_BROAD",
+    "HY_OAS",
+    "NFCI",
+    "RRP",
+    "WALCL"
+  ],
+  "primary_source_hit": true
+}
