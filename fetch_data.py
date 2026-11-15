@@ -254,26 +254,98 @@ def fetch_cboe(symbol: str) -> pd.Series | None:
 
 
 # ================================================================ 源 4：FRED
-def fetch_fred(series_id: str, start: str) -> pd.Series | None:
-    """FRED 官方 CSV，无需 API Key。缺失值以 '.' 或空表示。"""
-    raw = _get(FRED_URL.format(sid=series_id, frm=start),
-               retries=4, sleep_base=3.0, timeout=70)
+# FRED 在数据中心网络下会以「慢速分块」方式返回，urllib 的 read 容易整体超时
+# （实测 GitHub Actions 中 6 个序列全部 TimeoutError，而同时刻 curl 预检为 200）。
+# 因此主路径改用系统 curl，并把长区间切成若干窗口分别取，减小单次响应体。
+FRED_CHUNKS = [
+    ("2006-01-01", "2011-12-31"),
+    ("2012-01-01", "2017-12-31"),
+    ("2018-01-01", "2023-12-31"),
+    ("2024-01-01", "2026-12-31"),
+]
+
+
+def _curl_text(url: str, timeout: int = 90, retries: int = 3) -> str | None:
+    """用系统 curl 取文本。比 urllib 更能适应慢速/分块响应与重定向。"""
+    import shutil
+    import subprocess
+
+    if not shutil.which("curl"):
+        return None
+    last = ""
+    for attempt in range(1, retries + 1):
+        try:
+            # --http1.1 是必需的：FRED 的 HTTP/2 服务端会返回
+            # "HTTP/2 stream not closed cleanly: INTERNAL_ERROR"，
+            # 导致响应体被截断或直接失败；退回 1.1 后稳定。
+            p = subprocess.run(
+                ["curl", "-sSL", "--http1.1", "--compressed",
+                 "--max-time", str(timeout), "--retry", "2",
+                 "--retry-delay", "2", "--retry-all-errors",
+                 "-A", UA, "-H", "Accept: text/csv,*/*", url],
+                capture_output=True, text=True, timeout=timeout + 30,
+            )
+            out = p.stdout or ""
+            if p.returncode == 0 and out.strip():
+                return out
+            last = (p.stderr or "").strip()[:120] or f"rc={p.returncode}"
+        except Exception as e:                                # noqa: BLE001
+            last = f"{type(e).__name__}: {e}"
+        if attempt < retries:
+            time.sleep(2.0 * attempt)
+    if last:
+        print(f"    ! curl 失败: {last}")
+    return None
+
+
+def _parse_fred(raw: str | None) -> pd.Series | None:
     if not raw or not raw.strip():
         return None
     try:
         df = pd.read_csv(StringIO(raw))
-    except Exception as e:                                    # noqa: BLE001
-        print(f"    ! {series_id} CSV 解析失败: {e}")
+    except Exception:                                         # noqa: BLE001
         return None
     if df.shape[1] < 2:
         return None
-    dc = df.columns[0]
-    vc = df.columns[1]
-    s = pd.Series(pd.to_numeric(df[vc], errors="coerce").values,
-                  index=pd.to_datetime(df[dc], errors="coerce"))
+    s = pd.Series(
+        pd.to_numeric(df.iloc[:, 1], errors="coerce").values,
+        index=pd.to_datetime(df.iloc[:, 0], errors="coerce"),
+    )
     s = s[s.index.notna()].dropna()
-    if s.empty:
+    return s if not s.empty else None
+
+
+def fetch_fred(series_id: str, start: str) -> pd.Series | None:
+    """FRED 官方 CSV，无需 API Key。缺失值以 '.' 或空表示。
+
+    取数顺序：整段(curl) → 整段(urllib) → 分段(curl) → 分段(urllib)。
+    分段的意义：FRED 生成长区间 CSV 较慢，切窗后单次响应更小、更易成功。
+    """
+    url = FRED_URL.format(sid=series_id, frm=start)
+
+    s = _parse_fred(_curl_text(url))
+    if s is None:
+        s = _parse_fred(_get(url, retries=2, sleep_base=3.0, timeout=60))
+    if s is not None:
+        time.sleep(FRED_SLEEP)
+        return _norm(s.to_frame("v"))["v"]
+
+    parts: list[pd.Series] = []
+    for a, b in FRED_CHUNKS:
+        if b < start:
+            continue
+        a2 = max(a, start)
+        u = f"{FRED_URL.format(sid=series_id, frm=a2)}&coed={b}"
+        p = _parse_fred(_curl_text(u, timeout=60, retries=2))
+        if p is None:
+            p = _parse_fred(_get(u, retries=1, sleep_base=2.0, timeout=45))
+        if p is not None:
+            parts.append(p)
+        time.sleep(2.0)
+    if not parts:
         return None
+    s = pd.concat(parts).sort_index()
+    s = s[~s.index.duplicated(keep="last")]
     return _norm(s.to_frame("v"))["v"]
 
 
