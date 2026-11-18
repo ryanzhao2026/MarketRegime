@@ -1,8 +1,8 @@
 {
-  "fetched_at": "2026-11-17T23:06:33",
+  "fetched_at": "2026-11-18T23:04:35",
   "requested_start": "2006-01-03",
-  "latest_trading_day": "2026-11-17",
-  "rows": 5252,
+  "latest_trading_day": "2026-11-18",
+  "rows": 5253,
   "columns": 24,
   "per_column_source": {
     "SPY": "yfinance",
