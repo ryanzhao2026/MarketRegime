@@ -1,0 +1,43 @@
+{
+  "model_version": "v2",
+  "asof": "2026-11-23",
+  "regime": "Neutral",
+  "regime_cn": "中性震荡",
+  "regime_score": 40.31499377511283,
+  "confidence": 51.66662733503178,
+  "pillars": {
+    "risk_on": 61.62,
+    "breadth": 56.34,
+    "safety": 48.74,
+    "trend": 28.68,
+    "stability": 14.43
+  },
+  "contributions": {
+    "risk_on": 1.74,
+    "breadth": 1.27,
+    "safety": -0.25,
+    "trend": -5.33,
+    "stability": -7.11
+  },
+  "readings": {
+    "vix": 26.62,
+    "term_structure": 1.0567431014380102,
+    "term_structure_state": "趋平",
+    "credit_spread": 1.48,
+    "credit_source": "CREDIT_SPREAD",
+    "credit_label": "信用平稳",
+    "dollar_source": "DXY_BROAD",
+    "dxy_chg63_pct": 3.0889389427066094,
+    "skew": -0.032505420578976985,
+    "drawdown_pct": -7.2905569318050585,
+    "avg_corr": 0.4634328372420808
+  },
+  "drivers_positive": [
+    "跨资产 Risk-On（62/100，信用平稳）",
+    "广度 相对占优（56/100，贡献 +1.3pp）"
+  ],
+  "drivers_negative": [
+    "趋势偏弱（29/100，趋势初现）",
+    "波动率抬升（86/100，VIX 26.6）"
+  ]
+}
