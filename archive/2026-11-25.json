@@ -1,0 +1,43 @@
+{
+  "model_version": "v2",
+  "asof": "2026-11-25",
+  "regime": "Bear",
+  "regime_cn": "熊市",
+  "regime_score": 39.62219577526044,
+  "confidence": 51.020195966469316,
+  "pillars": {
+    "breadth": 59.26,
+    "risk_on": 59.77,
+    "safety": 47.81,
+    "trend": 26.46,
+    "stability": 13.14
+  },
+  "contributions": {
+    "breadth": 1.85,
+    "risk_on": 1.47,
+    "safety": -0.44,
+    "trend": -5.88,
+    "stability": -7.37
+  },
+  "readings": {
+    "vix": 28.29,
+    "term_structure": 1.0887551711169612,
+    "term_structure_state": "倒挂（近端恐慌）",
+    "credit_spread": 1.48,
+    "credit_source": "CREDIT_SPREAD",
+    "credit_label": "信用平稳",
+    "dollar_source": "DXY_BROAD",
+    "dxy_chg63_pct": 2.975710195229242,
+    "skew": 0.020982470887443188,
+    "drawdown_pct": -8.008060686185159,
+    "avg_corr": 0.45969634149429806
+  },
+  "drivers_positive": [
+    "广度 相对占优（59/100，贡献 +1.9pp）",
+    "跨资产 相对占优（60/100，贡献 +1.5pp）"
+  ],
+  "drivers_negative": [
+    "趋势偏弱（26/100，趋势初现）",
+    "波动率抬升（87/100，VIX 28.3）"
+  ]
+}
