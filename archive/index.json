@@ -61,5 +61,12 @@
     "regime": "Bear",
     "regime_score": 39.62219577526044,
     "confidence": 51.020195966469316
+  },
+  {
+    "asof": "2026-11-27",
+    "model_version": "v2",
+    "regime": "Neutral",
+    "regime_score": 42.07103391688264,
+    "confidence": 60.29349900371454
   }
 ]
